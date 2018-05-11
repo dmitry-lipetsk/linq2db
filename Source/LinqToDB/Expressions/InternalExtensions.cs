@@ -399,7 +399,7 @@ namespace LinqToDB.Expressions
 					if (!Equals(expr1.Arguments[i].EvaluateExpression(), expr2.Arguments[i].EvaluateExpression()))
 						return false;
 				}
-				else 
+				else
 					if (!expr1.Arguments[i].EqualsTo(expr2.Arguments[i], info))
 						return false;
 			}
@@ -751,6 +751,30 @@ namespace LinqToDB.Expressions
 			return ex;
 		}
 
+		public static Expression UnwrapWithAs(this Expression ex)
+		{
+			if (ex == null)
+				return null;
+
+			switch (ex.NodeType)
+			{
+				case ExpressionType.Quote: return ((UnaryExpression)ex).Operand.Unwrap();
+				case ExpressionType.ConvertChecked:
+				case ExpressionType.Convert:
+				case ExpressionType.TypeAs:
+					{
+						var ue = (UnaryExpression)ex;
+
+						if (!ue.Operand.Type.IsEnumEx())
+							return ue.Operand.Unwrap();
+
+						break;
+					}
+			}
+
+			return ex;
+		}
+
 		public static Dictionary<Expression,Expression> GetExpressionAccessors(this Expression expression, Expression path)
 		{
 			var accessors = new Dictionary<Expression,Expression>();
@@ -810,7 +834,7 @@ namespace LinqToDB.Expressions
 						if (e.Object != null)
 							return GetRootObject(e.Object, mapping);
 
-						if (e.Arguments != null && e.Arguments.Count > 0 && (e.IsQueryable() || e.IsAggregate(mapping) || e.IsAssociation(mapping)))
+						if (e.Arguments != null && e.Arguments.Count > 0 && (e.IsQueryable() || e.IsAggregate(mapping) || e.IsAssociation(mapping) || e.Method.IsSqlPropertyMethodEx()))
 							return GetRootObject(e.Arguments[0], mapping);
 
 						break;
@@ -821,7 +845,7 @@ namespace LinqToDB.Expressions
 						var e = (MemberExpression)expr;
 
 						if (e.Expression != null)
-							return GetRootObject(e.Expression.Unwrap(), mapping);
+							return GetRootObject(e.Expression.UnwrapWithAs(), mapping);
 
 						break;
 					}
@@ -922,7 +946,7 @@ namespace LinqToDB.Expressions
 						var call = (MethodCallExpression)expression;
 						var expr = call.Object;
 
-						if (expr == null && (call.IsQueryable() || call.IsAggregate(mapping) || call.IsAssociation(mapping)) && call.Arguments.Count > 0)
+						if (expr == null && (call.IsQueryable() || call.IsAggregate(mapping) || call.IsAssociation(mapping) || call.Method.IsSqlPropertyMethodEx()) && call.Arguments.Count > 0)
 							expr = call.Arguments[0];
 
 						if (expr != null)
@@ -944,7 +968,7 @@ namespace LinqToDB.Expressions
 
 						if (e.Expression != null)
 						{
-							var expr = FindLevel(e.Expression.Unwrap(), mapping, level, ref current);
+							var expr = FindLevel(e.Expression.UnwrapWithAs(), mapping, level, ref current);
 
 							if (level == current)
 								return expr;
@@ -990,7 +1014,10 @@ namespace LinqToDB.Expressions
 
 		public static object EvaluateExpression(this Expression expr)
 		{
-			switch (expr.NodeType) 
+			if (expr == null)
+				return null;
+
+			switch (expr.NodeType)
 			{
 				case ExpressionType.Constant:
 					return ((ConstantExpression)expr).Value;

@@ -15,17 +15,18 @@ namespace LinqToDB.DataProvider
 	using Mapping;
 	using SqlProvider;
 	using SqlQuery;
+	using System.Threading;
 
 	/// <summary>
 	/// Basic merge builder's validation options set to validate merge operation on SQL:2008 level without specific
 	/// database limitations or extensions.
 	/// </summary>
-	public class BasicMergeBuilder<TTarget, TSource>
+	public class BasicMergeBuilder<TTarget,TSource>
 		where TTarget : class
 		where TSource : class
 	{
 		#region .ctor
-		protected MergeDefinition<TTarget, TSource> Merge { get; private set; }
+		protected MergeDefinition<TTarget, TSource> Merge { get; }
 
 		public BasicMergeBuilder(DataConnection dataConnection, IMergeable<TTarget, TSource> merge)
 		{
@@ -99,17 +100,17 @@ namespace LinqToDB.DataProvider
 					LinqExtensions.SetMethodInfo8.MakeGenericMethod(typeof(int)),
 					new[] { join }));
 
-			var sql = ctx.SelectQuery;
+			var statement = ctx.GetResultStatement();
 
 			var selectContext = (SelectContext)ctx.Context;
 
-			var condition = sql.From.Tables[0].Joins[0].Condition;
-			SetSourceColumnAliases(condition, sql.From.Tables[0].Joins[0].Table.Source);
+			var condition = statement.SelectQuery.From.Tables[0].Joins[0].Condition;
+			SetSourceColumnAliases(condition, statement.SelectQuery.From.Tables[0].Joins[0].Table.Source);
 
 			ctx.SetParameters();
-			SaveParameters(sql.Parameters);
+			SaveParameters(statement.Parameters);
 
-			SqlBuilder.BuildSearchCondition(sql, condition, Command);
+			SqlBuilder.BuildSearchCondition(statement, condition, Command);
 
 			Command.Append(" ");
 		}
@@ -121,18 +122,16 @@ namespace LinqToDB.DataProvider
 
 			query = AddConditionOverSourceAndTarget(query, predicate);
 
-			var ctx = query.GetContext();
-			var sql = ctx.SelectQuery;
+			var ctx       = query.GetContext();
+			var statement = ctx.GetResultStatement();
 
-			var selectContext = (SelectContext)ctx.Context;
-
-			var tables = MoveJoinsToSubqueries(sql, _targetAlias, SourceAlias, QueryElement.Where);
-			SetSourceColumnAliases(sql.Where.SearchCondition, tables.Item2.Source);
+			var tables = MoveJoinsToSubqueries(statement, _targetAlias, SourceAlias, QueryElement.Where);
+			SetSourceColumnAliases(statement.SelectQuery.Where.SearchCondition, tables.Item2.Source);
 
 			ctx.SetParameters();
-			SaveParameters(sql.Parameters);
+			SaveParameters(statement.Parameters);
 
-			SqlBuilder.BuildSearchCondition(sql, sql.Where.SearchCondition, Command);
+			SqlBuilder.BuildSearchCondition(statement, statement.SelectQuery.Where.SearchCondition, Command);
 
 			Command.Append(" ");
 		}
@@ -143,19 +142,19 @@ namespace LinqToDB.DataProvider
 			bool isSource)
 			where TTable : class
 		{
-			var qry = _connection.GetTable<TTable>().Where(predicate);
-			var ctx = qry.GetContext();
-			var sql = ctx.SelectQuery;
+			var qry       = _connection.GetTable<TTable>().Where(predicate);
+			var ctx       = qry.GetContext();
+			var statement = ctx.GetResultStatement();
 
-			var tables = MoveJoinsToSubqueries(sql, tableAlias, null, QueryElement.Where);
+			var tables = MoveJoinsToSubqueries(statement, tableAlias, null, QueryElement.Where);
 
 			if (isSource)
-				SetSourceColumnAliases(sql.Where.SearchCondition, tables.Item1.Source);
+				SetSourceColumnAliases(statement.SelectQuery.Where.SearchCondition, tables.Item1.Source);
 
 			ctx.SetParameters();
-			SaveParameters(sql.Parameters);
+			SaveParameters(statement.Parameters);
 
-			SqlBuilder.BuildSearchCondition(sql, sql.Where.SearchCondition, Command);
+			SqlBuilder.BuildSearchCondition(statement, statement.SelectQuery.Where.SearchCondition, Command);
 
 			Command.Append(" ");
 		}
@@ -193,6 +192,9 @@ namespace LinqToDB.DataProvider
 						targetAlias, SqlBuilder.Convert(column.ColumnName, ConvertType.NameToQueryField),
 						sourceAlias, GetEscapedSourceColumnAlias(column.ColumnName));
 			}
+
+			if (first)
+				throw new LinqToDBException("Method OnTargetKey() needs at least one primary key column");
 		}
 
 		private void SetSourceColumnAliases(IQueryElement query, ISqlTableSource sourceTable)
@@ -212,21 +214,6 @@ namespace LinqToDB.DataProvider
 			});
 		}
 
-		private class QueryContext : IQueryContext
-		{
-			public SqlParameter[] SqlParameters;
-
-			public object         Context    { get; set; }
-
-			public List<string>   QueryHints { get; set; }
-
-			public SqlStatement   Statement  { get; set; }
-
-			public SqlParameter[] GetParameters()
-			{
-				return SqlParameters;
-			}
-		}
 		#endregion
 
 		#region MERGE : SOURCE
@@ -234,7 +221,7 @@ namespace LinqToDB.DataProvider
 
 		protected virtual void AddFakeSourceTableName()
 		{
-			SqlBuilder.BuildTableName(Command, FakeSourceTableDatabase, FakeSourceTableOwner, FakeSourceTable);
+			SqlBuilder.BuildTableName(Command, FakeSourceTableDatabase, FakeSourceTableSchema, FakeSourceTable);
 		}
 
 		protected virtual void AddSourceValue(
@@ -333,7 +320,7 @@ namespace LinqToDB.DataProvider
 		{
 			Command.AppendLine("USING");
 
-			if (Merge.QueryableSource != null && SuportsSourceSubQuery)
+			if (Merge.QueryableSource != null && SupportsSourceSubQuery)
 				BuildSourceSubQuery(Merge.QueryableSource);
 			else
 			{
@@ -343,6 +330,11 @@ namespace LinqToDB.DataProvider
 				else
 					BuildSourceSubQueryValues(source);
 			}
+		}
+
+		private void SetColumnAlias(string alias, string columnName)
+		{
+			_sourceAliases.Add(columnName, alias);
 		}
 
 		private string CreateSourceColumnAlias(string columnName, bool returnEscaped)
@@ -410,23 +402,22 @@ namespace LinqToDB.DataProvider
 				_connection.InlineParameters = !SupportsParametersInSource;
 
 				var ctx = queryableSource.GetMergeContext();
-				var query = ctx.SelectQuery;
 
-				// update list of selected fields
-				var info = ctx.FixSelectList();
+				ctx.UpdateParameters();
 
-				query.Select.Columns.Clear();
-				foreach (var column in info)
+				var statement = ctx.GetResultStatement();
+
+				foreach (var columnInfo in ctx.Columns)
 				{
-					var columnDescriptor = _sourceDescriptor.Columns.Single(_ => _.MemberInfo == column.Members[0]);
+					var columnDescriptor = _sourceDescriptor.Columns.Single(_ => _.MemberInfo == columnInfo.Members[0]);
+					var column           = statement.SelectQuery.Select.Columns[columnInfo.Index];
 
-					var alias = CreateSourceColumnAlias(columnDescriptor.ColumnName, false);
-					query.Select.Columns.Add(new SqlColumn(query, column.Sql, alias));
+					SetColumnAlias(column.Alias, columnDescriptor.ColumnName);
 				}
 
 				// bind parameters
-				query.Parameters.Clear();
-				new QueryVisitor().VisitAll(query, expr =>
+				statement.Parameters.Clear();
+				new QueryVisitor().VisitAll(ctx.SelectQuery, expr =>
 				{
 					switch (expr.ElementType)
 					{
@@ -434,7 +425,7 @@ namespace LinqToDB.DataProvider
 							{
 								var p = (SqlParameter)expr;
 								if (p.IsQueryParameter)
-									query.Parameters.Add(p);
+									statement.Parameters.Add(p);
 
 								break;
 							}
@@ -443,17 +434,9 @@ namespace LinqToDB.DataProvider
 
 				ctx.SetParameters();
 
-				SaveParameters(query.Parameters);
+				SaveParameters(statement.Parameters);
 
-				var queryContext = new QueryContext
-				{
-					Statement     = query,
-					SqlParameters = query.Parameters.ToArray()
-				};
-
-				var preparedQuery = DataConnection.QueryRunner.SetQuery(_connection, queryContext, 1);
-
-				Command.Append(preparedQuery.Commands[0]);
+				SqlBuilder.BuildSql(0, statement, Command, startIndent : 1);
 
 				var cs = new [] { ' ', '\t', '\r', '\n' };
 
@@ -527,6 +510,34 @@ namespace LinqToDB.DataProvider
 
 		private string GetSourceColumnAlias(string columnName)
 		{
+			if (!_sourceAliases.ContainsKey(columnName))
+			{
+				// this exception thrown when user use projection of mapping class in source query without all
+				// required fields
+				// Example:
+				/*
+				 * class Entity
+				 * {
+				 *     [PrimaryKey]
+				 *     public int Id { get; }
+				 *
+				 *     public int Field1 { get; }
+				 *
+				 *     public int Field2 { get; }
+				 * }
+				 *
+				 * db.Table
+				 *     .Merge()
+				 *     .Using(db.Entity.Select(e => new Entity() { Field1 = e.Field2 }))
+				 *     // here we expect Id primary key in source, but only Field1 selected
+				 *     .OnTargetKey()
+				 *     here we expect all fields from source, but only Field1 selected
+				 *     .InsertWhenNotMatched()
+				 *     .Merge();
+				 */
+				throw new LinqToDBException($"Column {columnName} doesn't exist in source");
+			}
+
 			return _sourceAliases[columnName];
 		}
 
@@ -682,7 +693,7 @@ namespace LinqToDB.DataProvider
 		{
 			Expression insertExpression = Expression.Call(
 				null,
-				LinqExtensions.InsertMethodInfo3.MakeGenericMethod(new[] { typeof(TSource), typeof(TTarget) }),
+				LinqExtensions.InsertMethodInfo3.MakeGenericMethod(typeof(TSource), typeof(TTarget)),
 				new[]
 				{
 					_connection.GetTable<TSource>().Expression,
@@ -690,38 +701,39 @@ namespace LinqToDB.DataProvider
 					Expression.Quote(create)
 				});
 
-			var qry   = Query<int>.GetQuery(DataContext, ref insertExpression);
-			var query = (SelectQuery)qry.Queries[0].Statement;
-
-			query.Insert.Into.Alias = _targetAlias;
-
-			// we need Insert type for proper query cloning (maybe this is a bug in clone function?)
-			query.ChangeQueryType(QueryType.Insert);
-
-			var tables = MoveJoinsToSubqueries(query, SourceAlias, null, QueryElement.InsertSetter);
-			SetSourceColumnAliases(query.Insert, tables.Item1.Source);
+			var qry = Query<int>.GetQuery(DataContext, ref insertExpression);
+			var statement = qry.Queries[0].Statement;
 
 			// we need InsertOrUpdate for sql builder to generate values clause
-			query.ChangeQueryType(QueryType.InsertOrUpdate);
+			var newInsert = new SqlInsertOrUpdateStatement(statement.SelectQuery) { Insert = statement.GetInsertClause(), Update = statement.GetUpdateClause() };
+			newInsert.Parameters.AddRange(statement.Parameters);
+			newInsert.Insert.Into.Alias = _targetAlias;
 
+			var tables = MoveJoinsToSubqueries(newInsert, SourceAlias, null, QueryElement.InsertSetter);
+			SetSourceColumnAliases(newInsert.Insert, tables.Item1.Source);
+
+			qry.Queries[0].Statement = newInsert;
 			QueryRunner.SetParameters(qry, DataContext, insertExpression, null, 0);
 
-			SaveParameters(query.Parameters);
+			SaveParameters(newInsert.Parameters);
 
 			if (IsIdentityInsertSupported
-				&& query.Insert.Items.Any(_ => _.Column is SqlField && ((SqlField)_.Column).IsIdentity))
+				&& newInsert.Insert.Items.Any(_ => _.Column is SqlField field && field.IsIdentity))
 				OnInsertWithIdentity();
 
-			SqlBuilder.BuildInsertClauseHelper(query, Command);
+			SqlBuilder.BuildInsertClauseHelper(newInsert, Command);
 		}
 
 		protected void BuildDefaultInsert()
 		{
+			// insert identity field values only if it is supported by database and field is not excluded from
+			// implicit insert operation by SkipOnInsert attribute
+			// see https://github.com/linq2db/linq2db/issues/914 for more details
 			var insertColumns = TargetDescriptor.Columns
-				.Where(c => IsIdentityInsertSupported && c.IsIdentity || !c.SkipOnInsert)
+				.Where(c => (IsIdentityInsertSupported && c.IsIdentity && !c.SkipOnInsert) || !c.SkipOnInsert)
 				.ToList();
 
-			if (IsIdentityInsertSupported && TargetDescriptor.Columns.Any(c => c.IsIdentity))
+			if (IsIdentityInsertSupported && insertColumns.Any(c => c.IsIdentity))
 				OnInsertWithIdentity();
 
 			Command.AppendLine("(");
@@ -821,29 +833,30 @@ namespace LinqToDB.DataProvider
 				new[] { updateQuery.Expression, target.Expression, Expression.Quote(predicate) });
 
 			var qry   = Query<int>.GetQuery(DataContext, ref updateExpression);
-			var query = (SelectQuery)qry.Queries[0].Statement;
+			var statement = qry.Queries[0].Statement;
 
 			if (ProviderUsesAlternativeUpdate)
-				BuildAlternativeUpdateQuery(query);
+				BuildAlternativeUpdateQuery(statement);
 			else
 			{
-				var tables = MoveJoinsToSubqueries(query, _targetAlias, SourceAlias, QueryElement.UpdateSetter);
-				SetSourceColumnAliases(query.Update, tables.Item2.Source);
+				var tables = MoveJoinsToSubqueries(statement, _targetAlias, SourceAlias, QueryElement.UpdateSetter);
+				SetSourceColumnAliases(statement.RequireUpdateClause(), tables.Item2.Source);
 			}
 
 			QueryRunner.SetParameters(qry, DataContext, updateExpression, null, 0);
-			SaveParameters(query.Parameters);
+			SaveParameters(statement.Parameters);
 
-			SqlBuilder.BuildUpdateSetHelper(query, Command);
+			SqlBuilder.BuildUpdateSetHelper((SqlUpdateStatement)statement, Command);
 		}
 
-		private void BuildAlternativeUpdateQuery(SelectQuery query)
+		private void BuildAlternativeUpdateQuery(SqlStatement statement)
 		{
+			var query    = statement.EnsureQuery();
 			var subQuery = (SelectQuery)QueryVisitor.Find(query.Where.SearchCondition, e => e.ElementType == QueryElementType.SqlQuery);
 			var target   = query.From.Tables[0];
 			target.Alias = _targetAlias;
 
-			SqlTableSource source = null;
+			SqlTableSource source;
 
 			if (subQuery.From.Tables.Count == 2)
 			{
@@ -871,12 +884,14 @@ namespace LinqToDB.DataProvider
 					}
 				});
 
-				((ISqlExpressionWalkable)query.Update).Walk(true, element => ConvertToSubquery(subQuery, element, tableSet, tables, (SqlTable)target.Source, (SqlTable)source.Source));
+				((ISqlExpressionWalkable)statement.RequireUpdateClause()).Walk(true,
+					element => ConvertToSubquery(subQuery, element, tableSet, tables, (SqlTable)target.Source,
+						(SqlTable)source.Source));
 			}
 
 			source.Alias = SourceAlias;
 
-			SetSourceColumnAliases(query.Update, source.Source);
+			SetSourceColumnAliases(statement.RequireUpdateClause(), source.Source);
 		}
 
 		protected void BuildDefaultUpdate()
@@ -957,7 +972,6 @@ namespace LinqToDB.DataProvider
 				if (tbl != firstTable && (secondTable == null || tbl != secondTable) && tableSet.Contains(tbl))
 				{
 					var tempCopy = sql.Clone();
-					tempCopy.ChangeQueryType(QueryType.Select);
 					var tempTables = new List<SqlTableSource>();
 
 					// create copy of tables from main FROM clause for subquery clause
@@ -1000,7 +1014,7 @@ namespace LinqToDB.DataProvider
 		}
 
 		private static Tuple<SqlTableSource, SqlTableSource> MoveJoinsToSubqueries(
-			SelectQuery  sql,
+			SqlStatement statement,
 			string       firstTableAlias,
 			string       secondTableAlias,
 			QueryElement part)
@@ -1011,7 +1025,7 @@ namespace LinqToDB.DataProvider
 			var tableSet = new HashSet<SqlTable>();
 			var tables   = new List<SqlTable>();
 
-			new QueryVisitor().Visit(sql.From, e =>
+			new QueryVisitor().Visit(statement.SelectQuery.From, e =>
 			{
 				if (e.ElementType == QueryElementType.TableSource)
 				{
@@ -1024,31 +1038,31 @@ namespace LinqToDB.DataProvider
 
 			if (tables.Count > baseTablesCount)
 			{
-				var firstTable  = (SqlTable)sql.From.Tables[0].Source;
+				var firstTable  = (SqlTable)statement.SelectQuery.From.Tables[0].Source;
 				var secondTable = baseTablesCount > 1
-					? (SqlTable)sql.From.Tables[0].Joins[0].Table.Source
+					? (SqlTable)statement.SelectQuery.From.Tables[0].Joins[0].Table.Source
 					: null;
 
 				ISqlExpressionWalkable queryPart;
 				switch (part)
 				{
 					case QueryElement.Where:
-						queryPart = sql.Where;
+						queryPart = statement.SelectQuery.Where;
 						break;
 					case QueryElement.InsertSetter:
-						queryPart = sql.Insert;
+						queryPart = statement.GetInsertClause();
 						break;
 					case QueryElement.UpdateSetter:
-						queryPart = sql.Update;
+						queryPart = statement.GetUpdateClause();
 						break;
 					default:
 						throw new InvalidOperationException();
 				}
 
-				queryPart.Walk(true, element => ConvertToSubquery(sql, element, tableSet, tables, firstTable, secondTable));
+				queryPart.Walk(true, element => ConvertToSubquery(statement.SelectQuery, element, tableSet, tables, firstTable, secondTable));
 			}
 
-			var table1   = sql.From.Tables[0];
+			var table1   = statement.SelectQuery.From.Tables[0];
 			table1.Alias = firstTableAlias;
 
 			SqlTableSource table2 = null;
@@ -1056,9 +1070,9 @@ namespace LinqToDB.DataProvider
 			if (secondTableAlias != null)
 			{
 				if (tables.Count > baseTablesCount)
-					table2 = sql.From.Tables[0].Joins[0].Table;
+					table2 = statement.SelectQuery.From.Tables[0].Joins[0].Table;
 				else
-					table2 = sql.From.Tables[1];
+					table2 = statement.SelectQuery.From.Tables[1];
 
 				table2.Alias = secondTableAlias;
 			}
@@ -1066,14 +1080,14 @@ namespace LinqToDB.DataProvider
 			return Tuple.Create(table1, table2);
 		}
 
-		private Expression<Func<TTuple, TTarget>> RewriteUpdatePredicateParameters<TTuple>(
-			IQueryable<TTuple>                          query,
-			Expression<Func<TTarget, TSource, TTarget>> predicate)
+		Expression<Func<TTuple, TTarget>> RewriteUpdatePredicateParameters<TTuple>(
+			IQueryable<TTuple>                        query,
+			Expression<Func<TTarget,TSource,TTarget>> predicate)
 		{
 			var p        = Expression.Parameter(typeof(TTuple));
 			var rewriter = new ExpressionParameterRewriter(p, predicate.Parameters[0], predicate.Parameters[1]);
 
-			return Expression.Lambda<Func<TTuple, TTarget>>(rewriter.Visit(predicate.Body), p);
+			return Expression.Lambda<Func<TTuple,TTarget>>(rewriter.Visit(predicate.Body), p);
 		}
 		#endregion
 
@@ -1096,18 +1110,19 @@ namespace LinqToDB.DataProvider
 
 			Expression updateExpression = Expression.Call(
 				null,
-				LinqExtensions.UpdateMethodInfo2.MakeGenericMethod(new[] { typeof(TTarget) }),
+				LinqExtensions.UpdateMethodInfo2.MakeGenericMethod(typeof(TTarget)),
 				new[] { _connection.GetTable<TTarget>().Expression, Expression.Quote(update) });
 
 			var qry = Query<int>.GetQuery(DataContext, ref updateExpression);
-			var query = (SelectQuery)qry.Queries[0].Statement;
+			var statement = (SqlUpdateStatement)qry.Queries[0].Statement;
 
-			MoveJoinsToSubqueries(query, _targetAlias, null, QueryElement.UpdateSetter);
+			MoveJoinsToSubqueries(statement, _targetAlias, null, QueryElement.UpdateSetter);
 
 			QueryRunner.SetParameters(qry, DataContext, updateExpression, null, 0);
-			SaveParameters(query.Parameters);
 
-			SqlBuilder.BuildUpdateSetHelper(query, Command);
+			SaveParameters(statement.Parameters);
+
+			SqlBuilder.BuildUpdateSetHelper(statement, Command);
 		}
 		#endregion
 
@@ -1124,13 +1139,7 @@ namespace LinqToDB.DataProvider
 		/// <summary>
 		/// List of generated command parameters.
 		/// </summary>
-		public DataParameter[] Parameters
-		{
-			get
-			{
-				return _parameters.ToArray();
-			}
-		}
+		public DataParameter[] Parameters => _parameters.ToArray();
 
 		/// <summary>
 		/// If true, command execution must return 0 without request to database.
@@ -1140,7 +1149,7 @@ namespace LinqToDB.DataProvider
 
 		protected string GetNextParameterName()
 		{
-			return string.Format("p{0}", _parameterCnt++);
+			return string.Format("p{0}", Interlocked.Increment(ref _parameterCnt));
 		}
 
 		private void SaveParameters(IEnumerable<SqlParameter> parameters)
@@ -1157,137 +1166,65 @@ namespace LinqToDB.DataProvider
 		#region Query Generation
 		protected readonly string SourceAlias = "Source";
 
-		private readonly string _targetAlias = "Target";
+		readonly string           _targetAlias = "Target";
+		readonly DataConnection   _connection;
+		         EntityDescriptor _sourceDescriptor;
 
-		private StringBuilder _command = new StringBuilder();
+		protected StringBuilder Command { get; } = new StringBuilder();
 
-		private DataConnection _connection;
-
-		private EntityDescriptor _sourceDescriptor;
-
-		protected StringBuilder Command
-		{
-			get
-			{
-				return _command;
-			}
-		}
-
-		protected IDataContext DataContext
-		{
-			get
-			{
-				return Merge.Target.DataContext;
-			}
-		}
-
-		protected int EnumerableSourceSize { get; private set; }
+		protected IDataContext  DataContext => Merge.Target.DataContext;
 
 		/// <summary>
 		/// If <see cref="SupportsSourceDirectValues"/> set to false and provider doesn't support SELECTs without
 		/// FROM clause, this property should contain name of table with single record.
 		/// </summary>
-		protected virtual string FakeSourceTable
-		{
-			get
-			{
-				return null;
-			}
-		}
+		protected virtual string FakeSourceTable => null;
 
 		/// <summary>
 		/// If <see cref="SupportsSourceDirectValues"/> set to false and provider doesn't support SELECTs without
 		/// FROM clause, this property could contain name of database for table with single record.
 		/// </summary>
-		protected virtual string FakeSourceTableDatabase
-		{
-			get
-			{
-				return null;
-			}
-		}
+		protected virtual string FakeSourceTableDatabase => null;
 
 		/// <summary>
 		/// If <see cref="SupportsSourceDirectValues"/> set to false and provider doesn't support SELECTs without
 		/// FROM clause, this property could contain name of schema for table with single record.
 		/// </summary>
-		protected virtual string FakeSourceTableOwner
-		{
-			get
-			{
-				return null;
-			}
-		}
+		protected virtual string FakeSourceTableSchema => null;
 
 		/// <summary>
 		/// If true, provider allows to set values of identity columns on insert operation.
 		/// </summary>
-		protected virtual bool IsIdentityInsertSupported
-		{
-			get
-			{
-				return false;
-			}
-		}
+		protected virtual bool IsIdentityInsertSupported => false;
 
 		/// <summary>
 		/// If true, builder will generate command for empty enumerable source;
 		/// otherwise command generation will be interrupted and 0 result returned without request to database.
 		/// </summary>
-		protected virtual bool EmptySourceSupported
-		{
-			get
-			{
-				return true;
-			}
-		}
+		protected virtual bool EmptySourceSupported => true;
 
-		protected BasicSqlBuilder SqlBuilder { get; private set; }
+		protected BasicSqlBuilder SqlBuilder { get; private set;  }
 
 		/// <summary>
 		/// If true, provider allows to generate subquery as a source element of merge command.
 		/// </summary>
-		protected virtual bool SuportsSourceSubQuery
-		{
-			get
-			{
-				return true;
-			}
-		}
+		protected virtual bool SupportsSourceSubQuery => true;
 
 		/// <summary>
 		/// If true, provider supports column aliases specification after table alias.
 		/// E.g. as table_alias (column_alias1, column_alias2).
 		/// </summary>
-		protected virtual bool SupportsColumnAliasesInTableAlias
-		{
-			get
-			{
-				return true;
-			}
-		}
+		protected virtual bool SupportsColumnAliasesInTableAlias => true;
 
 		/// <summary>
 		/// If true, provider supports list of VALUES as a source element of merge command.
 		/// </summary>
-		protected virtual bool SupportsSourceDirectValues
-		{
-			get
-			{
-				return true;
-			}
-		}
+		protected virtual bool SupportsSourceDirectValues => true;
 
 		/// <summary>
 		/// If false, parameters in source subquery select list must have type.
 		/// </summary>
-		protected virtual bool SupportsParametersInSource
-		{
-			get
-			{
-				return true;
-			}
-		}
+		protected virtual bool SupportsParametersInSource => true;
 
 		protected EntityDescriptor TargetDescriptor { get; private set; }
 
@@ -1326,20 +1263,20 @@ namespace LinqToDB.DataProvider
 		#endregion
 
 		#region Validation
-		private static MergeOperationType[] _matchedTypes = new[]
-						{
+		static readonly MergeOperationType[] _matchedTypes =
+		{
 			MergeOperationType.Delete,
 			MergeOperationType.Update,
 			MergeOperationType.UpdateWithDelete
 		};
 
-		private static MergeOperationType[] _notMatchedBySourceTypes = new[]
+		static readonly MergeOperationType[] _notMatchedBySourceTypes =
 		{
 			MergeOperationType.DeleteBySource,
 			MergeOperationType.UpdateBySource
 		};
 
-		private static MergeOperationType[] _notMatchedTypes = new[]
+		static readonly MergeOperationType[] _notMatchedTypes =
 		{
 			MergeOperationType.Insert
 		};
@@ -1348,75 +1285,39 @@ namespace LinqToDB.DataProvider
 		/// For providers, that use <see cref="BasicSqlOptimizer.GetAlternativeUpdate"/> method to build
 		/// UPDATE FROM query, this property should be set to true.
 		/// </summary>
-		protected virtual bool ProviderUsesAlternativeUpdate
-		{
-			get
-			{
-				return false;
-			}
-		}
+		protected virtual bool ProviderUsesAlternativeUpdate => false;
 
 		/// <summary>
 		/// If true, merge command could include DeleteBySource and UpdateBySource operations. Those operations
 		/// supported only by SQL Server.
 		/// </summary>
-		protected virtual bool BySourceOperationsSupported
-		{
-			get
-			{
-				return false;
-			}
-		}
+		protected virtual bool BySourceOperationsSupported => false;
 
 		/// <summary>
 		/// If true, merge command could include Delete operation. This operation is a part of SQL 2008 standard.
 		/// </summary>
-		protected virtual bool DeleteOperationSupported
-		{
-			get
-			{
-				return true;
-			}
-		}
+		protected virtual bool DeleteOperationSupported => true;
 
 		/// <summary>
 		/// Maximum number of oprations, allowed in single merge command. If value is less than one - there is no limits
 		/// on number of commands. This option is used by providers that have limitations on number of operations like
 		/// SQL Server.
 		/// </summary>
-		protected virtual int MaxOperationsCount
-		{
-			get
-			{
-				return 0;
-			}
-		}
+		protected virtual int MaxOperationsCount => 0;
 
 		/// <summary>
 		/// If true, merge command operations could have predicates. This is a part of SQL 2008 standard.
 		/// </summary>
-		protected virtual bool OperationPredicateSupported
-		{
-			get
-			{
-				return true;
-			}
-		}
+		protected virtual bool OperationPredicateSupported => true;
 
-		protected string ProviderName { get; private set; }
+		protected string ProviderName { get; }
 
 		/// <summary>
 		/// If true, merge command could have multiple operations of the same type with predicates with upt to one
 		/// command without predicate. This option is used by providers that doesn't allow multiple operations of the
 		/// same type like SQL Server.
 		/// </summary>
-		protected virtual bool SameTypeOperationsAllowed
-		{
-			get
-			{
-				return true;
-			}
-		}
+		protected virtual bool SameTypeOperationsAllowed => true;
 
 		/// <summary>
 		/// When this operation enabled, merge command cannot include Delete or Update operations together with
@@ -1424,13 +1325,7 @@ namespace LinqToDB.DataProvider
 		/// not allowed even without UpdateWithDelete operation.
 		/// This is Oracle-specific operation.
 		/// </summary>
-		protected virtual bool UpdateWithDeleteOperationSupported
-		{
-			get
-			{
-				return false;
-			}
-		}
+		protected virtual bool UpdateWithDeleteOperationSupported => false;
 
 		/// <summary>
 		/// Validates command configuration to not violate common or provider-specific rules.
@@ -1454,46 +1349,49 @@ namespace LinqToDB.DataProvider
 					case MergeOperationType.Delete:
 						hasDelete = true;
 						if (!DeleteOperationSupported)
-							throw new LinqToDBException(string.Format("Merge Delete operation is not supported by {0} provider.", ProviderName));
+							throw new LinqToDBException($"Merge Delete operation is not supported by {ProviderName} provider.");
 						if (!OperationPredicateSupported && operation.MatchedPredicate != null)
-							throw new LinqToDBException(string.Format("Merge operation conditions are not supported by {0} provider.", ProviderName));
+							throw new LinqToDBException($"Merge operation conditions are not supported by {ProviderName} provider.");
 						break;
 					case MergeOperationType.Insert:
 						if (!OperationPredicateSupported && operation.NotMatchedPredicate != null)
-							throw new LinqToDBException(string.Format("Merge operation conditions are not supported by {0} provider.", ProviderName));
+							throw new LinqToDBException($"Merge operation conditions are not supported by {ProviderName} provider.");
 						break;
 					case MergeOperationType.Update:
 						hasUpdate = true;
 						if (!OperationPredicateSupported && operation.MatchedPredicate != null)
-							throw new LinqToDBException(string.Format("Merge operation conditions are not supported by {0} provider.", ProviderName));
+							throw new LinqToDBException($"Merge operation conditions are not supported by {ProviderName} provider.");
 						break;
 					case MergeOperationType.DeleteBySource:
 						if (!BySourceOperationsSupported)
-							throw new LinqToDBException(string.Format("Merge Delete By Source operation is not supported by {0} provider.", ProviderName));
+							throw new LinqToDBException($"Merge Delete By Source operation is not supported by {ProviderName} provider.");
 						if (!OperationPredicateSupported && operation.BySourcePredicate != null)
-							throw new LinqToDBException(string.Format("Merge operation conditions are not supported by {0} provider.", ProviderName));
+							throw new LinqToDBException($"Merge operation conditions are not supported by {ProviderName} provider.");
 						break;
 					case MergeOperationType.UpdateBySource:
 						if (!BySourceOperationsSupported)
-							throw new LinqToDBException(string.Format("Merge Update By Source operation is not supported by {0} provider.", ProviderName));
+							throw new LinqToDBException($"Merge Update By Source operation is not supported by {ProviderName} provider.");
 						if (!OperationPredicateSupported && operation.BySourcePredicate != null)
-							throw new LinqToDBException(string.Format("Merge operation conditions are not supported by {0} provider.", ProviderName));
+							throw new LinqToDBException($"Merge operation conditions are not supported by {ProviderName} provider.");
 						break;
 					case MergeOperationType.UpdateWithDelete:
 						hasUpdateWithDelete = true;
 						if (!UpdateWithDeleteOperationSupported)
-							throw new LinqToDBException(string.Format("UpdateWithDelete operation not supported by {0} provider.", ProviderName));
+							throw new LinqToDBException($"UpdateWithDelete operation not supported by {ProviderName} provider.");
 						break;
 				}
 			}
 
 			// update/delete/updatewithdelete combinations validation
 			if (hasUpdateWithDelete && hasUpdate)
-				throw new LinqToDBException(string.Format("Update operation with UpdateWithDelete operation in the same Merge command not supported by {0} provider.", ProviderName));
+				throw new LinqToDBException(
+					$"Update operation with UpdateWithDelete operation in the same Merge command not supported by {ProviderName} provider.");
 			if (hasUpdateWithDelete && hasDelete)
-				throw new LinqToDBException(string.Format("Delete operation with UpdateWithDelete operation in the same Merge command not supported by {0} provider.", ProviderName));
+				throw new LinqToDBException(
+					$"Delete operation with UpdateWithDelete operation in the same Merge command not supported by {ProviderName} provider.");
 			if (UpdateWithDeleteOperationSupported && hasUpdate && hasDelete)
-				throw new LinqToDBException(string.Format("Delete and Update operations in the same Merge command not supported by {0} provider.", ProviderName));
+				throw new LinqToDBException(
+					$"Delete and Update operations in the same Merge command not supported by {ProviderName} provider.");
 
 			// - operations without conditions not placed before operations with conditions in each match group
 			// - there is no multiple operations without condition in each match group
@@ -1503,7 +1401,7 @@ namespace LinqToDB.DataProvider
 
 			// validate that there is no duplicate operations (by type) if provider doesn't support them
 			if (!SameTypeOperationsAllowed && Merge.Operations.GroupBy(_ => _.Type).Any(_ => _.Count() > 1))
-				throw new LinqToDBException(string.Format("Multiple operations of the same type are not supported by {0} provider.", ProviderName));
+				throw new LinqToDBException($"Multiple operations of the same type are not supported by {ProviderName} provider.");
 		}
 
 		private void ValidateGroupConditions(MergeOperationType[] groupTypes)
@@ -1530,13 +1428,15 @@ namespace LinqToDB.DataProvider
 
 		public static MergeContextParser.Context GetMergeContext<TSource>(this IQueryable<TSource> source)
 		{
-			if (source == null) throw new ArgumentNullException("source");
+			if (source == null) throw new ArgumentNullException(nameof(source));
 
-			return source.Provider.Execute<MergeContextParser.Context>(
+			var currentSource = LinqExtensions.ProcessSourceQueryable?.Invoke(source) ?? source;
+
+			return currentSource.Provider.Execute<MergeContextParser.Context>(
 				Expression.Call(
 					null,
 					_methodInfo.MakeGenericMethod(typeof(TSource)),
-					new[] { source.Expression }));
+					new[] { currentSource.Expression }));
 		}
 	}
 
@@ -1552,8 +1452,7 @@ namespace LinqToDB.DataProvider
 
 		public bool CanBuild(ExpressionBuilder builder, BuildInfo buildInfo)
 		{
-			var call = buildInfo.Expression as MethodCallExpression;
-			return call != null && call.Method.Name == "GetMergeContext";
+			return buildInfo.Expression is MethodCallExpression call && call.Method.Name == "GetMergeContext";
 		}
 
 		public SequenceConvertInfo Convert(ExpressionBuilder builder, BuildInfo buildInfo, ParameterExpression param)
@@ -1570,7 +1469,9 @@ namespace LinqToDB.DataProvider
 		{
 			public Action SetParameters;
 
-			private Action UpdateParameters;
+			public Action UpdateParameters;
+
+			public SqlInfo[] Columns;
 
 			public Context(IBuildContext context) : base(context)
 			{
@@ -1579,6 +1480,8 @@ namespace LinqToDB.DataProvider
 			public override void BuildQuery<T>(Query<T> query, ParameterExpression queryParameter)
 			{
 				query.DoNotCache = true;
+
+				Columns = ConvertToIndex(null, 0, ConvertFlags.All);
 
 				QueryRunner.SetNonQueryQuery(query);
 
@@ -1591,15 +1494,6 @@ namespace LinqToDB.DataProvider
 					query.Queries[0].Parameters.Clear();
 					query.Queries[0].Parameters.AddRange(Builder.CurrentSqlParameters);
 				};
-			}
-
-			public SqlInfo[] FixSelectList()
-			{
-				var columns = base.ConvertToIndex(null, 1, ConvertFlags.All);
-
-				UpdateParameters();
-
-				return columns;
 			}
 		}
 	}

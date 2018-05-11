@@ -701,7 +701,7 @@ void GenerateTypesFromMetadata()
 					SqlBuilder.BuildTableName(
 						new System.Text.StringBuilder(),
 						(string)SqlBuilder.Convert(DatabaseName,    LinqToDB.SqlProvider.ConvertType.NameToDatabase),
-						(string)SqlBuilder.Convert(p.Schema,        LinqToDB.SqlProvider.ConvertType.NameToOwner),
+						(string)SqlBuilder.Convert(p.Schema,        LinqToDB.SqlProvider.ConvertType.NameToSchema),
 						(string)SqlBuilder.Convert(p.ProcedureName, LinqToDB.SqlProvider.ConvertType.NameToQueryTable)
 					).ToString();
 
@@ -874,7 +874,9 @@ void GenerateTypesFromMetadata()
 
 string NormalizeStringName(string name)
 {
-	return @"@""" + name.Replace(@"""", @"""""") + @"""";
+	if (name.Contains("\"") || name.Contains("\\"))
+		return @"@""" + name.Replace(@"""", @"""""") + @"""";
+	return "\"" + name + "\"";
 }
 
 #>
